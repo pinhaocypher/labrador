@@ -17,8 +17,18 @@
 #include "labrador.h"
 
 size_t comkey_len = 0;
+// polx is a polynomial extension, can use NTT to speed up
+// typedef struct {
+//   poly vec[K];
+// } polx;
+// K is determined by data.h
 polx *comkey = NULL;
 
+//TODO: not figure out 
+// triangular matrix 
+// used to efficiently store symmetric matrix
+// i, j are indices of the matrix
+// r is the rank of the matrix
 static size_t triangularidx(size_t i,size_t j,size_t r) {
   if(i>j) {  // swap
     j ^= i;
@@ -29,6 +39,10 @@ static size_t triangularidx(size_t i,size_t j,size_t r) {
   return i;
 }
 
+// short integer solution secure
+// TODO: 
+// 1. Why maxlog is 2*sqrt(LOGQ*LOGDELTA*N)*sqrt(rank)?
+// 2. And why this is secure?
 int sis_secure(size_t rank, double norm) {
   double maxlog;
 
@@ -40,26 +54,39 @@ int sis_secure(size_t rank, double norm) {
     return 0;
 }
 
-void init_comkey(size_t len) {
-  size_t i;
-  size_t chunks;
-  __attribute__((aligned(16)))
-  uint8_t seed[16] = {};
-  polx *buf;
+/**
+ * Initialize or extend the commitment key to the specified length.
+ * The commitment key is used for ajtai commitment and is stored in chunks
+ * of 32 polynomial vectors.
+ *
+ * @param target_length The desired length of the commitment key
+ */
+void init_comkey(size_t target_length) {
+    /* If current length is sufficient, no action needed */
+    if (comkey_len >= target_length) {
+        return;
+    }
 
-  if(comkey_len >= len)
-    return;
+    /* Calculate number of 32-polynomial chunks needed */
+    size_t num_chunks = (target_length + 31) / 32;
+    
+    /* Allocate new buffer with 64-byte alignment for optimal performance */
+    __attribute__((aligned(16))) uint8_t random_seed[16] = {};
+    polx* new_buffer = _aligned_alloc(64, num_chunks * 32 * sizeof(polx));
 
-  chunks = (len+31)/32;
-  buf = _aligned_alloc(64,chunks*32*sizeof(polx));
-  if(comkey_len) polxvec_copy(buf,comkey,comkey_len);
-  free(comkey);
-  comkey = buf;
+    /* Copy existing commitment key if it exists */
+    if (comkey_len) {
+        polxvec_copy(new_buffer, comkey, comkey_len);
+    }
+    free(comkey);
+    comkey = new_buffer;
 
-  for(i=comkey_len/32;i<chunks;i++)
-    polxvec_almostuniform(&comkey[32*i],32,seed,i);
+    /* Generate new polynomial vectors using almost uniform distribution */
+    for (size_t chunk_idx = comkey_len/32; chunk_idx < num_chunks; chunk_idx++) {
+        polxvec_almostuniform(&comkey[32 * chunk_idx], 32, random_seed, chunk_idx);
+    }
 
-  comkey_len = chunks*32;
+    comkey_len = num_chunks * 32;
 }
 
 void free_comkey(void) {
@@ -148,8 +175,8 @@ int init_proof(proof *pi, const witness *wt, int quadratic, int tail) {
 
     /* uniform decomposition */
     if(!tail) {
-      cpp->fu = (LOGQ+2*cpp->b/3)/cpp->b;
-      cpp->bu = (LOGQ+cpp->fu/2)/cpp->fu;
+      cpp->fu = (LOGQ+2*cpp->b/3)/cpp->b; //t_1
+      cpp->bu = (LOGQ+cpp->fu/2)/cpp->fu; //b_1
     }
     else {
       cpp->fu = 1;
@@ -187,6 +214,9 @@ int init_proof(proof *pi, const witness *wt, int quadratic, int tail) {
     }
 
     /* commitment ranks */
+    // ldexp is function in C math.h
+    // ldexp(x,y) = x * 2^y
+    
     for(cpp->kappa=1;cpp->kappa<=32;cpp->kappa++) {
       pi->normsq = (ldexp(1,2*cpp->b)/12*(cpp->f-1) + varz/ldexp(1,2*cpp->b*(cpp->f-1)))*nn;
       if(!tail) {
@@ -557,6 +587,7 @@ size_t qugarbage_raw(polx *u, poly *g, size_t r, size_t n, const polx s[r][n],
   if(!cpp->fg)
     return off;
 
+// garbage polynomial g
   polxvec_setzero(gx,len);
   for(l=0;l<n;l++) {
     k = 0;
@@ -660,6 +691,7 @@ int project(statement *ost, proof *pi, uint8_t jlmat[][ost->n][256*N/8], const w
     memset(pi->p,0,256*sizeof(int32_t));
     j = k = 0;
     for(i=0;i<r;i++) {
+      // AES128CTR_BLOCKBYTES = 512
       aes128ctr_squeezeblocks(jlmat[j][k],n[i]*256*N/8/AES128CTR_BLOCKBYTES,&aesctx);
       polyvec_jlproj_add(pi->p,iwt->s[i],n[i],jlmat[j][k]);
       k += n[i];
@@ -768,7 +800,7 @@ void reduce_lift_aggregate_zqcnst(statement *ost, const proof *pi, size_t i, con
   polz_topolx(cnst->b,b);
 
   memcpy(hashbuf,ost->h,16);
-  polz_bitpack(&hashbuf[16],&pi->bb[i]);
+  polzvec_bitpack(&hashbuf[16],&pi->bb[i]);
   shake128(hashbuf,32,hashbuf,sizeof(hashbuf));
   memcpy(ost->h,hashbuf,16);
   polxvec_quarternary(alpha,1,&hashbuf[16],0);
@@ -849,7 +881,7 @@ static void aggregate(statement *ost, const proof *pi, const statement *ist) {
   for(i=0;i<r;i++) {
     polxvec_polx_mul(tmp,&ist->c[i],gamma,cpp->kappa);
     for(j=0;j<cpp->fu;j++) {
-      if(j) polxvec_scale(tmp,tmp,cpp->kappa,(int64_t)1 << cpp->bu);
+      if(j) polxvec_scale(tmp,tmp,cpp->kappa,(int64_t)1 << j*cpp->bu);
       polxvec_add(&phiv[t+i*l+j*cpp->kappa],&phiv[t+i*l+j*cpp->kappa],tmp,cpp->kappa);
     }
   }
@@ -936,6 +968,8 @@ static void amortize_tail(statement *ost, witness *owt, proof *pi, polx sx[ost->
   memcpy(hashbuf,ost->h,16);
   polzvec_bitpack(&hashbuf[16],&hz[0],1);
   shake128(hashbuf,32,hashbuf,16+N*QBYTES);
+
+  // compute challenge parapeters
   polxvec_challenge(&ost->c[0],1,&hashbuf[16],0);
 
   polxvec_polx_mul(sx[0],&ost->c[0],sx[0],n);
@@ -1091,7 +1125,8 @@ int prove(statement *ost, witness *owt, proof *pi, const statement *ist, const w
   constraint cnst[1] = {};
   void *buf = NULL;
 
-  ret = init_proof(pi,iwt,ist->cpp->fg != 0,tail);
+  ret = 
+  (pi,iwt,ist->cpp->fg != 0,tail);
   if(ret) // commitments not secure (1/2)
     return ret;
   init_statement(ost,pi,ist->h);

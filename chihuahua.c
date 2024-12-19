@@ -16,6 +16,8 @@
 #include "labrador.h"
 #include "chihuahua.h"
 
+// Constraint Setup Flow
+// 1. Define Constraints: ex. set_prncplstmnt_lincnst_raw()
 polx *init_sparsecnst_half(sparsecnst *cnst, size_t r, size_t nz, size_t buflen, size_t deg,
                            int quadratic, int homogeneous)
 {
@@ -25,6 +27,7 @@ polx *init_sparsecnst_half(sparsecnst *cnst, size_t r, size_t nz, size_t buflen,
   cnst->nz = nz;
   cnst->a->len = 0;
   if(quadratic) {
+    // construct a sparse matrix
     buf = _malloc((r*r+r)*sizeof(size_t));
     cnst->a->rows = (size_t*)buf;
     cnst->a->cols = (size_t*)buf + (r*r+r)/2;
@@ -207,21 +210,29 @@ int sparsecnst_check(const sparsecnst *cnst, polx *sx[], const witness *wt) {
   return ret;
 }
 
+// principal statement
 int init_prncplstmnt_raw(prncplstmnt *st, size_t r, const size_t n[r],
                          uint64_t betasq, size_t k, int quadratic)
 {
   size_t i;
   void *buf;
-
+  
+  //norm bound check
   if(betasq > JLMAXNORMSQ) {
     fprintf(stderr,"ERROR in init_prcplstmnt_raw(): Total witness norm too big for JL projection\n");
     return 1;
   }
-
+  //sparse constraint
+  //The constraints can be linear or quadratic, depending on the quadratic parameter.
+  //
   buf = _malloc(r*sizeof(size_t) + k*sizeof(sparsecnst));
   st->n = (size_t*)buf;
   st->cnst = (sparsecnst*)&st->n[r];
 
+  //r: number of witness vectors
+  //k: number of dot-product constraints
+  //quadratic: indicates if quadratic constraints are used
+  //betasq: norm bound
   st->r = r;
   st->k = k;
   st->quadratic = quadratic;
