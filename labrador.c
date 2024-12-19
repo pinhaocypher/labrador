@@ -95,200 +95,231 @@ void free_comkey(void) {
   comkey_len = 0;
 }
 
+/**
+ * Initialize proof parameters for labrador proof.
+ * This function sets up various parameters needed for generating proofs,
+ * including commitment ranks, decomposition parameters, and security checks.
+ *
+ * @param pi         Pointer to proof structure to initialize
+ * @param wt         Pointer to witness structure containing input parameters
+ * @param quadratic  Type of proof (0: constant, 1: liear, 2: quadratic)
+ * @param tail       Flag indicating if tail recursion optimization should be used
+ * @return          0 on success, error code on failure
+ */
 int init_proof(proof *pi, const witness *wt, int quadratic, int tail) {
-  size_t i,j,k,t,u;
-  size_t nn,rr;
-  int ret,decompose;
-  double vars,varz,varg;
-  void *buf;
-  comparams *cpp = pi->cpp;
+    /* Parameter initialization */
+    comparams *cpp = pi->cpp;
+    size_t proof_rank = (quadratic == 2) ? 2 * wt->r + 1 : wt->r;
+    pi->r = proof_rank;
+    pi->tail = tail;
 
-  pi->r = (quadratic == 2) ? 2*wt->r + 1 : wt->r;
-  pi->tail = tail;
+    /* Allocate memory for norm squares and dimension arrays */
+    uint64_t normsq[proof_rank];
+    void *memory_buffer = _malloc(2 * proof_rank * sizeof(size_t));
+    pi->n = (size_t*)memory_buffer;
+    pi->nu = (size_t*)&pi->n[proof_rank];
 
-  uint64_t normsq[pi->r];
-  buf = _malloc(2*pi->r*sizeof(size_t));
-  pi->n   = (size_t*)buf;
-  pi->nu  = (size_t*)&pi->n[pi->r];
-
-  if(quadratic == 2) {
-    for(i=0;i<wt->r;i++) {
-      pi->n[i] = wt->n[i];
-      pi->n[wt->r+1+i] = wt->n[i];  // sigmam1 / flip
-      normsq[i] = wt->normsq[i];
-      normsq[wt->r+1+i] = (TAU1+4*TAU2)*wt->normsq[i];
+    /* Initialize dimensions and norms based on proof type */
+    if (quadratic == 2) {
+        init_double_quadratic_params(pi, wt, normsq);
+    } else {
+        init_linear_or_simple_quadratic_params(pi, wt, normsq, quadratic);
     }
-    pi->n[wt->r] = (LOGQ+9)/10*wt->r;  // Zq to Rq liftings
-    normsq[wt->r] = ldexp(1,20)/12*pi->n[wt->r]*N;
 
-    for(i=0;i<pi->r;i++)
-      pi->nu[i] = 0;
-    pi->nu[wt->r-1] = -(size_t)1;
+    /* Find optimal decomposition parameters */
+    for (int k = 15; k > 0; k--) {
+        size_t max_dimension = compute_rank_decomposition(pi);
+        size_t total_rank = compute_total_rank(pi);
+        
+        /* Calculate variance and determine decomposition strategy */
+        double variance_z = compute_variance_z(pi, normsq, max_dimension);
+        bool needs_decomposition = should_decompose(variance_z, tail);
+        
+        if (needs_decomposition) {
+            cpp->f = 2;
+            cpp->b = round((log2(12) + log2(variance_z)) / 4);  // log2(sqrt(12*var))
+        } else {
+            cpp->f = 1;
+            cpp->b = round((log2(12) + log2(variance_z)) / 2);
+        }
+
+        /* Set uniform decomposition parameters */
+        if (!tail) {
+            cpp->fu = (LOGQ + 2 * cpp->b / 3) / cpp->b;  // t_1
+            cpp->bu = (LOGQ + cpp->fu / 2) / cpp->fu;    // b_1
+        } else {
+            cpp->fu = 1;
+            cpp->bu = LOGQ;
+        }
+
+        /* Configure quadratic garbage parameters */
+        configure_quadratic_params(cpp, pi, normsq, quadratic, tail, max_dimension);
+
+        /* Find secure commitment ranks */
+        if (!find_secure_commitment_ranks(pi, cpp, total_rank, variance_z, tail, quadratic)) {
+            break;
+        }
+    }
+
+    /* Allocate memory for proof vectors */
+    void *proof_buffer = _aligned_alloc(64, (cpp->u1len + cpp->u2len + LIFTS) * sizeof(polz));
+    pi->u1 = (polz*)proof_buffer;
+    pi->u2 = (polz*)&pi->u1[cpp->u1len];
+    pi->bb = (polz*)&pi->u2[cpp->u2len];
+
+    /* Validate security parameters */
+    if (cpp->kappa > 32) {
+        fprintf(stderr, "ERROR in init_proof(): Cannot make inner commitments secure!\n");
+        free_proof(pi);
+        return 1;
+    }
+    if (cpp->kappa1 > 32) {
+        fprintf(stderr, "ERROR in init_proof(): Cannot make outer commitments secure!\n");
+        free_proof(pi);
+        return 2;
+    }
+
+    return 0;
+}
+
+/**
+ * Initialize parameters for double quadratic proofs (quadratic == 2)
+ */
+static void init_double_quadratic_params(proof *pi, const witness *wt, uint64_t *normsq) {
+    for (size_t i = 0; i < wt->r; i++) {
+        /* Set dimensions */
+        pi->n[i] = wt->n[i];
+        pi->n[wt->r + 1 + i] = wt->n[i];  // sigmam1 / flip
+        
+        /* Set norm squares */
+        normsq[i] = wt->normsq[i];
+        normsq[wt->r + 1 + i] = (TAU1 + 4 * TAU2) * wt->normsq[i];
+    }
+    
+    /* Set Zq to Rq lifting parameters */
+    pi->n[wt->r] = (LOGQ + 9) / 10 * wt->r;
+    normsq[wt->r] = ldexp(1, 20) / 12 * pi->n[wt->r] * N;
+
+    /* Initialize nu array */
+    for (size_t i = 0; i < pi->r; i++) {
+        pi->nu[i] = 0;
+    }
+    pi->nu[wt->r - 1] = -(size_t)1;
     pi->nu[wt->r] = -(size_t)1;
-    pi->nu[2*wt->r] = -(size_t)1;
-  }
-  else {
-    for(i=0;i<pi->r;i++) {
-      pi->n[i] = wt->n[i];
-      normsq[i] = wt->normsq[i];
-      pi->nu[i] = (quadratic) ? -(size_t)1 : 0;
+    pi->nu[2 * wt->r] = -(size_t)1;
+}
+
+/**
+ * Initialize parameters for linear (quadratic == 0) or simple quadratic (quadratic == 1) proofs
+ */
+static void init_linear_or_simple_quadratic_params(proof *pi, const witness *wt, uint64_t *normsq, int quadratic) {
+    for (size_t i = 0; i < pi->r; i++) {
+        pi->n[i] = wt->n[i];
+        normsq[i] = wt->normsq[i];
+        pi->nu[i] = quadratic ? -(size_t)1 : 0;
     }
     pi->nu[pi->r - 1] = -(size_t)1;
-  }
+}
 
-  for(k=15;k>0;k--) {
-    /* decomposition / joining in rank */
-    nn = t = 0;
-    for(i=0;i<pi->r;i++) {
-      t += pi->n[i];
-      if(pi->nu[i]) {
-        pi->nu[i] = t;
-        nn = MAX(nn,t);
-        t = 0;
-      }
-    }
-    nn = (nn+k-1)/k;
-    for(i=0;i<pi->r;i++)
-      if(pi->nu[i])
-        pi->nu[i] = (pi->nu[i]+nn-1)/nn;
-
-    rr = 0;
-    for(i=0;i<pi->r;i++)
-      rr += pi->nu[i];
-
-    /* decomposition in width */
-    varz = 0;
-    for(i=0;i<pi->r;i++)
-      varz += normsq[i];
-    varz /= nn*N;
-    varz *= TAU1+4*TAU2;
-    decompose = !tail && !sis_secure(13,6*T*SLACK*sqrt(2*(TAU1+4*TAU2)*varz*nn*N));
-    decompose = decompose || 64*varz > (1 << 28);
-    if(decompose) {
-      cpp->f = 2;
-      cpp->b = round((log2(12)+log2(varz))/4);  // log2(sqrt(12*var))
-    }
-    else {
-      cpp->f = 1;
-      cpp->b = round((log2(12)+log2(varz))/2);
-    }
-
-    /* uniform decomposition */
-    if(!tail) {
-      cpp->fu = (LOGQ+2*cpp->b/3)/cpp->b; //t_1
-      cpp->bu = (LOGQ+cpp->fu/2)/cpp->fu; //b_1
-    }
-    else {
-      cpp->fu = 1;
-      cpp->bu = LOGQ;
-    }
-
-    /* quadratic garbage decomposition */
-    varg = 0;
-    cpp->bg = cpp->b;
-    if(!quadratic)
-      cpp->fg = 0;
-    else if(tail)
-      cpp->fg = 1;
-    else {
-      t = u = 0;
-      for(i=0;i<pi->r;i++) {
-        vars = (double)normsq[i]/(pi->n[i]*N);
-        j = pi->n[i];
-        while(j >= nn-u) {
-          j -= nn-u;
-          t += vars*vars*(nn-u);
-          varg = MAX(varg,t);
-          t = u = 0;
-        }
-        t += vars*vars*j;
-        u += j;
-        if(pi->nu[i]) {
-          varg = MAX(varg,t);
-          t = u = 0;
-        }
-      }
-      varg *= 2*N;
-      cpp->fg = ceil((log2(12)+log2(varg))/(2*cpp->b));
-      cpp->fg = MAX(1,cpp->fg);
-    }
-
-    /* commitment ranks */
-    // ldexp is function in C math.h
-    // ldexp(x,y) = x * 2^y
+/**
+ * Compute rank decomposition and return maximum dimension
+ */
+static size_t compute_rank_decomposition(proof *pi) {
+    size_t max_dimension = 0;
+    size_t total = 0;
     
-    for(cpp->kappa=1;cpp->kappa<=32;cpp->kappa++) {
-      pi->normsq = (ldexp(1,2*cpp->b)/12*(cpp->f-1) + varz/ldexp(1,2*cpp->b*(cpp->f-1)))*nn;
-      if(!tail) {
-        pi->normsq += (ldexp(1,2*cpp->bu)*(cpp->fu-1)
-                       + ldexp(1,2*(LOGQ-(cpp->fu-1)*cpp->bu)))/12*(rr*cpp->kappa+(rr*rr+rr)/2);
-      }
-      if(!tail && quadratic)
-        pi->normsq += (ldexp(1,2*cpp->bg)/12*(cpp->fg-1) + varg/ldexp(1,2*(cpp->fg-1)*cpp->bg))*(rr*rr+rr)/2;
-      pi->normsq *= N;
-      if(sis_secure(cpp->kappa,6*T*SLACK*ldexp(1,(cpp->f-1)*cpp->b)*sqrt(pi->normsq)))
-        break;
+    for (size_t i = 0; i < pi->r; i++) {
+        total += pi->n[i];
+        if (pi->nu[i]) {
+            pi->nu[i] = total;
+            max_dimension = MAX(max_dimension, total);
+            total = 0;
+        }
+    }
+    
+    return max_dimension;
+}
+
+/**
+ * Compute total rank from nu array
+ */
+static size_t compute_total_rank(proof *pi) {
+    size_t total_rank = 0;
+    for (size_t i = 0; i < pi->r; i++) {
+        if (pi->nu[i]) {
+            total_rank++;
+        }
+    }
+    return total_rank;
+}
+
+/**
+ * Compute variance Z parameter
+ */
+static double compute_variance_z(const proof *pi, const uint64_t *normsq, size_t max_dimension) {
+    double variance = 0;
+    for (size_t i = 0; i < pi->r; i++) {
+        variance += normsq[i];
+    }
+    variance /= max_dimension * N;
+    variance *= TAU1 + 4 * TAU2;
+    return variance;
+}
+
+/**
+ * Determine if decomposition is needed based on variance and security parameters
+ */
+static bool should_decompose(double variance_z, int tail) {
+    if (tail) {
+        return false;
+    }
+    bool security_requires_decomp = !sis_secure(13, 6 * T * SLACK * sqrt(2 * (TAU1 + 4 * TAU2) * variance_z));
+    bool variance_requires_decomp = 64 * variance_z > (1 << 28);
+    return security_requires_decomp || variance_requires_decomp;
+}
+
+/**
+ * Configure quadratic garbage parameters
+ */
+static void configure_quadratic_params(comparams *cpp, const proof *pi, const uint64_t *normsq,
+                                     int quadratic, int tail, size_t max_dimension) {
+    cpp->bg = cpp->b;
+    
+    if (!quadratic) {
+        cpp->fg = 0;
+        return;
+    }
+    
+    if (tail) {
+        cpp->fg = 1;
+        return;
+    }
+    
+    double max_variance = compute_max_quadratic_variance(pi, normsq, max_dimension);
+    cpp->fg = ceil((log2(12) + log2(max_variance)) / (2 * cpp->b));
+    cpp->fg = MAX(1, cpp->fg);
+}
+
+/**
+ * Find secure commitment ranks
+ * Returns true if parameters need to be adjusted, false if secure parameters found
+ */
+static bool find_secure_commitment_ranks(proof *pi, comparams *cpp, size_t total_rank,
+                                       double variance_z, int tail, int quadratic) {
+    /* Find secure inner commitment rank */
+    for (cpp->kappa = 1; cpp->kappa <= 32; cpp->kappa++) {
+        compute_proof_norm_square(pi, cpp, total_rank, variance_z, tail, quadratic);
+        
+        if (sis_secure(cpp->kappa, 6 * T * SLACK * ldexp(1, (cpp->f - 1) * cpp->b) * sqrt(pi->normsq))) {
+            break;
+        }
     }
 
-    if(!tail) {
-      for(cpp->kappa1=1;cpp->kappa1<=32;cpp->kappa1++)
-        if(sis_secure(cpp->kappa1,2*SLACK*sqrt(pi->normsq)))
-          break;
-
-      cpp->u1len = cpp->u2len = cpp->kappa1;
-      if(cpp->kappa <= 32 && cpp->kappa1 <= 32 && cpp->fu*rr*cpp->kappa + (cpp->fu+cpp->fg)*(rr*rr+rr)/2 <= 1.1*nn)
-        break;
+    if (tail) {
+        return configure_tail_parameters(cpp, total_rank, variance_z);
+    } else {
+        return configure_non_tail_parameters(cpp, pi, total_rank);
     }
-    else {
-      cpp->kappa1 = 0;
-      cpp->u1len = rr*cpp->kappa;
-      if(quadratic) cpp->u1len += (rr*rr+rr)/2;
-      cpp->u2len = 2*rr - 1;
-      if(cpp->kappa <= 32 && (cpp->u1len + cpp->u2len)*LOGQ <= 1.1*nn*(log2(varz)/2+2.05))
-        break;
-    }
-  }
-
-  buf = _aligned_alloc(64,(cpp->u1len+cpp->u2len+LIFTS)*sizeof(polz));
-  pi->u1  = (polz*)buf;
-  pi->u2  = (polz*)&pi->u1[cpp->u1len];
-  pi->bb  = (polz*)&pi->u2[cpp->u2len];
-
-  if(cpp->kappa > 32) {
-    fprintf(stderr,"ERROR in init_proof(): Cannot make inner commitments secure!\n");
-    ret = 1;
-    goto err;
-  }
-  else if(cpp->kappa1 > 32) {
-    fprintf(stderr,"ERROR in init_proof(): Cannot make outer commitments secure!\n");
-    ret = 2;
-    goto err;
-  }
-  return 0;
-
-err:
-  free_proof(pi);
-  return ret;
-
-  /* solve m = fu*kappa*r + (fu+fg)*(r^2+r)/2 = a*r^2 + b*r = n_i/nu_i = nn/r *
-   * where r = \sum_i nu_i, nn = \sum_i n_i, and n_i/nu_i = const             */
-/*
-  double a,b,y,m,r;
-  a = (cpp->fu + cpp->fg)/2.0;
-  b = cpp->fu*cpp->kappa + a;
-  r = 64;
-  for(i=0;i<10;i++) {
-    y = (a*r+b)*r*r-nn;
-    m = (3*a*r+2*b)*r;
-    r -= y/m;
-  }
-
-  nn = ceil(nn/r);
-  for(i=0;i<pi->r;i++) {
-    pi->nu[i] = (pi->n[i]+nn/2)/nn;
-    pi->nu[i] = MAX(1,pi->nu[i]);
-  }
-*/
 }
 
 void free_proof(proof *pi) {
